@@ -1,0 +1,220 @@
+---
+title: "Visualizing text as graphs"
+author: "Adam Spannbauer"
+date: "2025-03"
+output: 
+  html_document:
+    mathjax: "default"
+    code_folding: hide
+    df_print: paged
+    theme: flatly
+    toc: true
+    toc_float: true
+    toc_depth: 4
+---
+
+
+```{r warning=FALSE, message=FALSE}
+library(tidyverse)
+library(udpipe)
+library(visNetwork)
+```
+
+### Load udpipe tagger
+
+```{r}
+udpipe_file <- "english-ewt-ud-2.5-191206.udpipe"
+
+if (!file.exists(udpipe_file)) {
+  message("udpipe model not found...")
+  response <- readline("Would you like to download it? (y/n): ")
+
+  if (tolower(response) == "y") {
+    udpipe_download_model(language = "english", dir = dirnmae(udpipe_file))
+  } else {
+    message("ok... fix it yourself then...")
+  }
+}
+
+udmodel <- udpipe_load_model(file = udpipe_file)
+```
+
+### Function to plot sentence tree
+
+```{r}
+UPOS_TAGS <- c(
+  "ADJ", "ADP", "ADV", "AUX", "CCONJ", "DET", "INTJ",
+  "NOUN", "NUM", "PART", "PRON", "PROPN", "PUNCT",
+  "SCONJ", "SYM", "VERB", "X"
+)
+
+UPOS_COLOR_MAP <- scales::hue_pal()(length(UPOS_TAGS))
+names(UPOS_COLOR_MAP) <- UPOS_TAGS
+
+UPOS_COLOR_DF <- data.frame(
+  label = UPOS_TAGS,
+  color = unname(UPOS_COLOR_MAP)
+)
+
+udpipe_tag <- function(doc_vec, udmodel) {
+  tagged_doc <- udpipe_annotate(udmodel, x = doc_vec)
+  tagged_doc_df <- as.data.frame(tagged_doc)
+
+  # Adding vocab idx
+  vocab_df <- tagged_doc_df |>
+    select(lemma) |>
+    group_by(lemma) |>
+    summarise(n = n()) |>
+    mutate(vocab_token_id = 1:n())
+
+  tagged_doc_df <- vocab_df |>
+    select(-n) |>
+    right_join(tagged_doc_df, by = "lemma")
+
+  list(tagged_doc_df = tagged_doc_df, vocab_df = vocab_df)
+}
+
+plot_sentence_tree <- function(tagged_sent_df) {
+  edges_df <- data.frame(
+    to = tagged_sent_df$token_id,
+    from = tagged_sent_df$head_token_id
+  ) |>
+    filter(from != 0)
+
+  nodes_df <- data.frame(
+    id = tagged_sent_df$token_id,
+    label = paste0(tagged_sent_df$token_id, ": ", tagged_sent_df$token),
+    color = UPOS_COLOR_MAP[tagged_sent_df$upos],
+    group = tagged_sent_df$upos
+  )
+
+  legend_items <- UPOS_COLOR_DF |>
+    filter(label %in% unique(tagged_sent_df$upos))
+
+  net <- visNetwork(nodes_df, edges_df)
+
+  for (upos in UPOS_TAGS) {
+    net <- net |>
+      visGroups(groupname = upos, color = unname(UPOS_COLOR_MAP[upos]))
+  }
+
+  net |>
+    visLegend(useGroups = FALSE, addNodes = legend_items) |>
+    visHierarchicalLayout(sortMethod = "directed")
+}
+
+
+doc2graph <- function(tagged_doc_df, vocab_df, directed = TRUE, node_size_range = c(5, 30)) {
+  edges_df <- tagged_doc_df |>
+    left_join(tagged_doc_df, by = c("head_token_id" = "token_id", "sentence_id", "doc_id")) |>
+    select(from = vocab_token_id.y, to = vocab_token_id.x)
+
+  if (!directed) {
+    edges_df <- edges_df |>
+      select(to = from, from = to) |>
+      bind_rows(edges_df)
+  }
+
+  edges_df <- edges_df |>
+    filter(!is.na(from), !is.na(to)) |>
+    distinct()
+
+  node_degree <- edges_df |>
+    pivot_longer(cols = c(from, to), values_to = "id") |>
+    count(id, name = "degree")
+
+  if (!directed) {
+    node_degree <- node_degree |>
+      mutate(degree = degree / 2)
+  }
+
+  # Merge POS into nodes_df
+  nodes_df <- vocab_df |>
+    mutate(label = lemma) |>
+    select(id = vocab_token_id, label) |>
+    left_join(tagged_doc_df |> select(lemma, upos), by = c("label" = "lemma")) |>
+    left_join(node_degree, by = "id") |>
+    mutate(
+      size = degree,
+      font = list(size = 20), # Increase label font size
+      color = UPOS_COLOR_MAP[upos]
+    ) |>
+    mutate(size = ifelse(is.na(size), 0, size)) |>
+    mutate(size = node_size_range[1] + ((node_size_range[2] - node_size_range[1]) * (degree - min(degree)) / (max(degree) - min(degree)))) |> 
+    group_by(id) |>
+    slice(1) |>
+    ungroup() |>
+    mutate(label = paste0(label, " (", upos, ", degree=", degree, ")"))
+
+  list(nodes_df = nodes_df, edges_df = edges_df)
+}
+
+
+plot_doc_graph <- function(tagged_doc_df, vocab_df, directed = TRUE) {
+  nodes_edges <- doc2graph(tagged_doc_df, vocab_df, directed)
+
+  legend_items <- UPOS_COLOR_DF |>
+    filter(label %in% unique(nodes_edges$nodes_df$upos))
+
+  net <- visNetwork(nodes_edges$nodes_df, nodes_edges$edges_df)
+
+  for (upos in legend_items$label) {
+    net <- net |>
+      visGroups(groupname = upos, color = unname(UPOS_COLOR_MAP[upos]))
+  }
+
+  net |>
+    visLegend(useGroups = FALSE, addNodes = legend_items)
+}
+```
+
+### Loading data
+
+```{r}
+patents <- read.csv("target_patents.csv")
+patents <- na.omit(patents)
+names(patents) <- tolower(gsub("[^[:alnum:]]", "_", names(patents)))
+
+head(patents)
+```
+
+### UDPipe tagging
+
+```{r}
+tagged <- udpipe_tag(patents$abstract[1], udmodel)
+tagged$tagged_doc_df
+```
+
+### Demo of single sentence tree
+
+```{r}
+tagged$tagged_doc_df |>
+  filter(sentence_id == 1) |>
+  plot_sentence_tree()
+```
+
+### Plotting a doc as a graph
+
+```{r}
+plot_doc_graph(tagged$tagged_doc_df, tagged$vocab_df, directed = TRUE)
+```
+
+### Converting a corpus to a graph
+
+Smaller sample of documents
+
+```{r}
+docs <- patents$abstract[1:5]
+tagged <- udpipe_tag(docs, udmodel)
+
+plot_doc_graph(tagged$tagged_doc_df, tagged$vocab_df, directed = FALSE)
+```
+
+### Full set of patents
+
+```{r}
+# docs <- patents$abstract
+# tagged <- udpipe_tag(docs, udmodel)
+# 
+# plot_doc_graph(tagged$tagged_doc_df, tagged$vocab_df, directed = TRUE)
+```
