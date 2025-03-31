@@ -13,11 +13,48 @@ output:
     toc_depth: 4
 ---
 
+## Navigation
+
+The floating table of contents to the left can be used to quickly navigate; noteworthy sections listed below.
+
+* Most/all of the write-up is in **Overview and results**
+* Different visuals are in **Visualizing text as graphs**
+* Generic graph analysis is in **Network analysis** - **Graph properties**
+* A comparison of keyword extraction to TextRank is in **Network analysis** - **PageRank keyword identification**
+* A brief exploration of `node2vec` embeddings is in **Network analysis** - **node2vec**
+
+## Overview and results
+
+This notebook explores the use of dependency graphs to visualize and analyze text data.  This is similar to the approach shown by Levy, O., & Goldberg, Y. (2014) in their dependency-based word embeddings paper.  However, they don't convert the dependcies into a full corpus graph.  Further literature review needs to explore the work done in this area for potential research gaps.
+
+In this notebook, words are represented as nodes in a directed graph by merging all dependency parsed sentence trees in a corpus. The edges are created based on the dependency relationships between words in the text, and these edges have weights relating to the count of occurances the relationship has. The resulting graph can be analyzed to extract keyword insights and ideally to create word embeddings with a different point-of-view than window based methods.
+
+Keyword extraction is compared to a TextRank approach (Mihalcea, R., & Tarau, P. 2004).  With it being an unsupervised process - and due to a lack of familiarity with the data.  It is tough to compare these initial results and declare a winner.  There are similarities between the results (Pearson $r \approx 0.72$), but there are some larger disagreements on some words in the corpus.  More work needs to be done to investigate how these high residual tokens are being used in the text.
+
+Node2vec (Grover, A., & Leskovec, J. 2016) embeddings are also explored.  The embeddings are projected to 2D with UMAP (McInnes, L., Healy, J., & Melville, J. 2018) for visualization.  The embeddings are then used to find similar words and to perform analogies.
+
+The hypothesis for this corpus is that querying for similar vectors will be succesful based on subjective interpretation, but that analogies won't be as useful given the smaller size of the corpus.
+
+In practice, the node2vec process is prohibitively slow (using the R implementation by `node2vec` R package).  Future experiments will look into other node embedding strategies (i.e. graph convolutional networks - Kipf, T. N., & Welling, M. 2016).  As of writing this, it looks like the process with the current parameters won't finish by the assignment's due date... the back-up plan is to use random walks with walk length and number of walks that might be too small to be useful.  Because of this, little to no commentary provided on node2vec output. 
+
+On my machine, this graph using node2vec with the default 80 walk length is processing at a speed of about 5 walks per hour; I've arbitrarily set to 32 walks which will take longer than I have until the deadline.
+
+## Setup
+
+### Libs
 
 ```{r warning=FALSE, message=FALSE}
 library(tidyverse)
 library(udpipe)
+
+library(igraph)
 library(visNetwork)
+library(plotly)
+
+library(textrank)
+
+library(node2vec)
+library(uwot)
 ```
 
 ### Load udpipe tagger
@@ -39,23 +76,12 @@ if (!file.exists(udpipe_file)) {
 udmodel <- udpipe_load_model(file = udpipe_file)
 ```
 
-### Function to plot sentence tree
+### Helper functions
+
+#### Tagger
 
 ```{r}
-UPOS_TAGS <- c(
-  "ADJ", "ADP", "ADV", "AUX", "CCONJ", "DET", "INTJ",
-  "NOUN", "NUM", "PART", "PRON", "PROPN", "PUNCT",
-  "SCONJ", "SYM", "VERB", "X"
-)
-
-UPOS_COLOR_MAP <- scales::hue_pal()(length(UPOS_TAGS))
-names(UPOS_COLOR_MAP) <- UPOS_TAGS
-
-UPOS_COLOR_DF <- data.frame(
-  label = UPOS_TAGS,
-  color = unname(UPOS_COLOR_MAP)
-)
-
+# Apply udpipe and store vocab idxs
 udpipe_tag <- function(doc_vec, udmodel) {
   tagged_doc <- udpipe_annotate(udmodel, x = doc_vec)
   tagged_doc_df <- as.data.frame(tagged_doc)
@@ -73,7 +99,83 @@ udpipe_tag <- function(doc_vec, udmodel) {
 
   list(tagged_doc_df = tagged_doc_df, vocab_df = vocab_df)
 }
+```
 
+#### Convert to graph
+
+```{r}
+# Accept output from udpipe_tag and convert to nodes_df, edges_df, and igraph object
+doc2graph <- function(tagged_doc_df, vocab_df, directed = TRUE, node_size_range = c(5, 30)) {
+  edges_df <- tagged_doc_df |>
+    left_join(tagged_doc_df, by = c("head_token_id" = "token_id", "sentence_id", "doc_id")) |>
+    select(from = vocab_token_id.y, to = vocab_token_id.x)
+
+  if (!directed) {
+    edges_df <- edges_df |>
+      select(to = from, from = to) |>
+      bind_rows(edges_df)
+  }
+
+  edges_df <- edges_df |>
+    filter(!is.na(from), !is.na(to)) |>
+    group_by(from, to) |>
+    summarise(weight = n(), .groups = "drop") |>
+    ungroup()
+
+  node_degree <- edges_df |>
+    pivot_longer(cols = c(from, to), values_to = "id") |>
+    count(id, name = "degree")
+
+  if (!directed) {
+    node_degree <- node_degree |>
+      mutate(degree = degree / 2)
+  }
+
+  # Merge POS into nodes_df
+  nodes_df <- vocab_df |>
+    mutate(label = lemma) |>
+    select(id = vocab_token_id, label, lemma) |>
+    left_join(tagged_doc_df |> select(lemma, upos), by = c("label" = "lemma")) |>
+    left_join(node_degree, by = "id") |>
+    mutate(
+      size = degree,
+      font = list(size = 20), # Increase label font size
+      color = UPOS_COLOR_MAP[upos]
+    ) |>
+    mutate(size = ifelse(is.na(size), 0, size)) |>
+    mutate(size = node_size_range[1] + ((node_size_range[2] - node_size_range[1]) * (degree - min(degree)) / (max(degree) - min(degree)))) |>
+    group_by(id) |>
+    slice(1) |>
+    ungroup() |>
+    mutate(label = paste0(label, " (", upos, ", degree=", degree, ")"))
+
+  # Convert nodes_df and edges_df to igraph object
+  igraph_obj <- graph_from_data_frame(edges_df, vertices = nodes_df, directed = directed)
+
+  list(nodes_df = nodes_df, edges_df = edges_df, igraph_obj = igraph_obj)
+}
+```
+
+#### Graph plotting
+
+```{r}
+# For coloring by POS
+UPOS_TAGS <- c(
+  "ADJ", "ADP", "ADV", "AUX", "CCONJ", "DET", "INTJ",
+  "NOUN", "NUM", "PART", "PRON", "PROPN", "PUNCT",
+  "SCONJ", "SYM", "VERB", "X"
+)
+
+UPOS_COLOR_MAP <- scales::hue_pal()(length(UPOS_TAGS))
+names(UPOS_COLOR_MAP) <- UPOS_TAGS
+
+UPOS_COLOR_DF <- data.frame(
+  label = UPOS_TAGS,
+  color = unname(UPOS_COLOR_MAP)
+)
+
+
+# Plot sentence tree in hierarchical visNetwork
 plot_sentence_tree <- function(tagged_sent_df) {
   edges_df <- data.frame(
     to = tagged_sent_df$token_id,
@@ -104,52 +206,8 @@ plot_sentence_tree <- function(tagged_sent_df) {
 }
 
 
-doc2graph <- function(tagged_doc_df, vocab_df, directed = TRUE, node_size_range = c(5, 30)) {
-  edges_df <- tagged_doc_df |>
-    left_join(tagged_doc_df, by = c("head_token_id" = "token_id", "sentence_id", "doc_id")) |>
-    select(from = vocab_token_id.y, to = vocab_token_id.x)
-
-  if (!directed) {
-    edges_df <- edges_df |>
-      select(to = from, from = to) |>
-      bind_rows(edges_df)
-  }
-
-  edges_df <- edges_df |>
-    filter(!is.na(from), !is.na(to)) |>
-    distinct()
-
-  node_degree <- edges_df |>
-    pivot_longer(cols = c(from, to), values_to = "id") |>
-    count(id, name = "degree")
-
-  if (!directed) {
-    node_degree <- node_degree |>
-      mutate(degree = degree / 2)
-  }
-
-  # Merge POS into nodes_df
-  nodes_df <- vocab_df |>
-    mutate(label = lemma) |>
-    select(id = vocab_token_id, label) |>
-    left_join(tagged_doc_df |> select(lemma, upos), by = c("label" = "lemma")) |>
-    left_join(node_degree, by = "id") |>
-    mutate(
-      size = degree,
-      font = list(size = 20), # Increase label font size
-      color = UPOS_COLOR_MAP[upos]
-    ) |>
-    mutate(size = ifelse(is.na(size), 0, size)) |>
-    mutate(size = node_size_range[1] + ((node_size_range[2] - node_size_range[1]) * (degree - min(degree)) / (max(degree) - min(degree)))) |> 
-    group_by(id) |>
-    slice(1) |>
-    ungroup() |>
-    mutate(label = paste0(label, " (", upos, ", degree=", degree, ")"))
-
-  list(nodes_df = nodes_df, edges_df = edges_df)
-}
-
-
+# Plot document as graph in visNetwork (no tree layout)
+# Slow with large graphs
 plot_doc_graph <- function(tagged_doc_df, vocab_df, directed = TRUE) {
   nodes_edges <- doc2graph(tagged_doc_df, vocab_df, directed)
 
@@ -166,9 +224,54 @@ plot_doc_graph <- function(tagged_doc_df, vocab_df, directed = TRUE) {
   net |>
     visLegend(useGroups = FALSE, addNodes = legend_items)
 }
+
+# Plot document as graph in igraph
+# Use for large graphs (still not useful, but fast to see how unuseful it is)
+plot_doc_igraph <- function(tagged_doc_df, vocab_df, directed = TRUE) {
+  nodes_edges <- doc2graph(tagged_doc_df, vocab_df, directed)
+
+  deg <- degree(nodes_edges$igraph_obj)
+  scaled_size <- scales::rescale(deg, to = c(2, 10))
+
+  # only label top % degree nodes
+  threshold <- quantile(deg, 0.95)
+  V(nodes_edges$igraph_obj)$label <- ifelse(deg >= threshold, V(nodes_edges$igraph_obj)$label, NA)
+
+
+  legend_entries <- UPOS_COLOR_DF |>
+    filter(label %in% unique(nodes_edges$nodes_df$upos))
+
+  # layout <- layout_with_graphopt(nodes_edges$igraph_obj, charge = 0.05, niter = 1000)
+
+  plot(
+    nodes_edges$igraph_obj,
+    # layout = layout,
+    vertex.size = scaled_size,
+    vertex.label.cex = 0.6,
+    vertex.label.color = "black",
+    edge.arrow.size = 0.3,
+    edge.curved = 0.1,
+    margin = 0, # REMOVE BIG MARGINS
+    rescale = TRUE, # Keep this TRUE to fit window
+    xlim = c(-1, 1),
+    ylim = c(-1, 1),
+    asp = 0
+  )
+  legend(
+    "topright",
+    legend = legend_entries$label,
+    col = "black",
+    pt.bg = legend_entries$color,
+    pch = 21,
+    pt.cex = 1.5,
+    cex = 0.6,
+    bty = "n",
+    ncol = 1
+  )
+}
 ```
 
-### Loading data
+## Target patents data
 
 ```{r}
 patents <- read.csv("target_patents.csv")
@@ -178,28 +281,42 @@ names(patents) <- tolower(gsub("[^[:alnum:]]", "_", names(patents)))
 head(patents)
 ```
 
+## Visualizing text as graphs
+
 ### UDPipe tagging
 
 ```{r}
-tagged <- udpipe_tag(patents$abstract[1], udmodel)
+tagged <- udpipe_tag(sample(patents$abstract, 1), udmodel)
 tagged$tagged_doc_df
 ```
 
-### Demo of single sentence tree
+### Single sentence tree
+
+Use scroll to zoom in and out (needed on some long sentences).
 
 ```{r}
+rand_sent_id <- sample(tagged$tagged_doc_df$sentence_id, 1)
+
 tagged$tagged_doc_df |>
-  filter(sentence_id == 1) |>
+  filter(sentence_id == rand_sent_id) |>
   plot_sentence_tree()
 ```
 
 ### Plotting a doc as a graph
 
+Use scroll to zoom in and out (labels disappear at certain level of zoomed out).
+
 ```{r}
 plot_doc_graph(tagged$tagged_doc_df, tagged$vocab_df, directed = TRUE)
 ```
 
-### Converting a corpus to a graph
+Static `igraph` version
+
+```{r}
+plot_doc_igraph(tagged$tagged_doc_df, tagged$vocab_df, directed = TRUE)
+```
+
+### Multiple documents
 
 Smaller sample of documents
 
@@ -207,14 +324,243 @@ Smaller sample of documents
 docs <- patents$abstract[1:5]
 tagged <- udpipe_tag(docs, udmodel)
 
-plot_doc_graph(tagged$tagged_doc_df, tagged$vocab_df, directed = FALSE)
+plot_doc_graph(tagged$tagged_doc_df, tagged$vocab_df, directed = TRUE)
+plot_doc_igraph(tagged$tagged_doc_df, tagged$vocab_df, directed = TRUE)
 ```
 
 ### Full set of patents
 
+Wow, very useful visual!
+
 ```{r}
-# docs <- patents$abstract
-# tagged <- udpipe_tag(docs, udmodel)
-# 
-# plot_doc_graph(tagged$tagged_doc_df, tagged$vocab_df, directed = TRUE)
+docs <- patents$abstract
+tagged <- udpipe_tag(docs, udmodel)
+
+plot_doc_igraph(tagged$tagged_doc_df, tagged$vocab_df, directed = TRUE)
 ```
+
+## Network analysis
+
+### Graph properties
+
+```{r}
+docs <- patents$abstract
+
+FULL_TAGGED <- udpipe_tag(docs, udmodel)
+FULL_GRAPH <- doc2graph(FULL_TAGGED$tagged_doc_df, FULL_TAGGED$vocab_df, directed = TRUE)
+
+cat("Number of nodes: ", vcount(FULL_GRAPH$igraph_obj), "\n")
+cat("Number of edges: ", ecount(FULL_GRAPH$igraph_obj), "\n")
+cat("Average degree: ", mean(degree(FULL_GRAPH$igraph_obj)), "\n")
+cat("Graph density: ", edge_density(FULL_GRAPH$igraph_obj), "\n")
+cat("Global transitivity: ", transitivity(FULL_GRAPH$igraph_obj, type = "global"), "\n")
+
+hist(degree(FULL_GRAPH$igraph_obj), main = "Degree distribution")
+abline(v = mean(degree(FULL_GRAPH$igraph_obj)), col = "red")
+```
+
+### PageRank keyword identification
+
+Similar to word level TextRank (https://aclanthology.org/W04-3252.pdf) approach - but they build edges based on sliding window.  TextRank sentence level approach builds graph off of sentences TF-IDF similarity.
+
+```{r}
+FULL_GRAPH$nodes_df$pagerank <- page_rank(FULL_GRAPH$igraph_obj)$vector
+
+# Remove some uninteresting POS
+include_pos <- c("NOUN", "VERB", "ADJ", "PROPN")
+exclude_pos <- setdiff(unique(FULL_GRAPH$nodes_df$upos), include_pos)
+
+FULL_GRAPH$nodes_df |>
+  arrange(-pagerank) |>
+  filter(upos %in% include_pos) |>
+  select(c("label", "upos", "pagerank")) |>
+  head(10)
+```
+
+#### Comparison to TextRank output
+
+It should be a more semantically rich graph than TextRank due to the connections between words having direct semantic relationships rather than just co-occurrence.
+
+It should be a less dense graph than TextRank due to the more direct connections.
+
+Does a dense graph beat a sparser more semantically rich graph? ("rich" is kinda arbitrary though)
+
+```{r}
+FULL_TAGGED$tagged_doc_df <- FULL_TAGGED$tagged_doc_df |>
+  arrange(doc_id, sentence_id, token_id)
+
+# TextRank keyword extraction
+keywords <- textrank_keywords(
+  FULL_TAGGED$tagged_doc_df$lemma,
+  relevant = FULL_TAGGED$tagged_doc_df$upos %in% include_pos,
+  ngram_max = 3,
+  sep = " "
+)
+
+textrank_df <- data.frame(
+  lemma = names(keywords$pagerank$vector),
+  textrank = keywords$pagerank$vector
+)
+rownames(textrank_df) <- NULL
+
+textrank_df |>
+  arrange(-textrank) |>
+  head(10)
+```
+
+##### Biggest disagreements
+
+```{r warning=FALSE}
+compare_df <- textrank_df |>
+  inner_join(FULL_GRAPH$nodes_df, by = "lemma") |>
+  filter(upos %in% include_pos) |>
+  mutate(residual = textrank - pagerank) |>
+  select(lemma, upos, textrank, pagerank, residual) |>
+  arrange(desc(abs(residual)))
+
+compare_df |>
+  mutate(label = ifelse(min_rank(desc(residual)) <= 10, lemma, NA)) |>
+  mutate(label = ifelse(min_rank(residual) <= 3, lemma, label)) |>
+  ggplot(aes(x = textrank, y = pagerank)) +
+  # ggplot(aes(x = scale(textrank), y = scale(pagerank))) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "#bbb") +
+  geom_text(aes(label = label), hjust = 0, vjust = -0.2) +
+  labs(
+    title = "Comparison of TextRank and dependency graph PageRank",
+    subtitle = paste0("Pearson correlation = ", round(cor(compare_df$textrank, compare_df$pagerank), 3), "; dashed line at x = y"),
+    x = "TextRank (from co-occurrence)",
+    y = "PageRank (from dependency graph)"
+  ) +
+  xlim(c(0, 0.022))
+  theme_minimal()
+```
+
+##### Words more important to dependency graph
+
+```{r}
+compare_df |>
+  arrange(residual) |>
+  head(5)
+```
+
+##### Words more important to TextRank
+
+```{r}
+compare_df |>
+  arrange(-residual) |>
+  head(5)
+```
+
+### node2vec
+
+Explore node2vec embeddings (briefly).
+
+```{r results='hide'}
+start <- Sys.time()
+
+FORCE_RETRAIN <- TRUE
+
+NUM_WALKS <- 8
+WALK_LENGTH <- 32
+OUTPUT_DIM <- 128
+
+if (FORCE_RETRAIN | !file.exists("node2vec_embeddings.csv")) {
+  # convert edges from ids to labels
+  edges_df <- FULL_GRAPH$edges_df |>
+    left_join(FULL_GRAPH$nodes_df, by = c("from" = "id")) |>
+    select(from = label, to, weight) |>
+    left_join(FULL_GRAPH$nodes_df, by = c("to" = "id")) |>
+    select(from, to = label, weight) |>
+    mutate(from = gsub(" \\([A-Z]+, degree=\\d+\\)", "", from)) |>
+    mutate(to = gsub(" \\([A-Z]+, degree=\\d+\\)", "", to)) |>
+    as.data.frame()
+
+  embeddings <- node2vecR(
+    data = edges_df,
+    num_walks = NUM_WALKS, # default is 10
+    walk_length = WALK_LENGTH, # default is 80
+    directed = TRUE,
+    dim = OUTPUT_DIM # default is 128
+  )
+
+  # to csv
+  write.csv(embeddings, "node2vec_embeddings.csv", row.names = TRUE)
+} else {
+  embeddings <- read.csv("node2vec_embeddings.csv", row.names = 1)
+}
+
+end <- Sys.time()
+```
+
+```{r}
+end - start
+```
+
+
+#### Visualize embeddings
+
+Dimension reduction with UMAP.
+
+```{r}
+umap_result <- umap(embeddings, n_neighbors = 15, min_dist = 0.1, metric = "cosine")
+
+umap_df <- as.data.frame(umap_result) |>
+  rownames_to_column("term") |>
+  rename(x = V1, y = V2) |>
+  left_join(FULL_GRAPH$nodes_df, by = c("term" = "lemma"))
+
+p <- ggplot(umap_df, aes(x = x, y = y, text = term, color = upos)) +
+  geom_point() +
+  theme_minimal() +
+  labs(
+    title = "UMAP Projection of Node2Vec Embeddings",
+    subtitle = "Embeddings from dependency graph projected with UMAP (cosine distance)\nHover to see individual terms"
+  )
+
+ggplotly(p, tooltip = "text")
+```
+
+#### Query for similarity
+
+```{r}
+cos_sim <- function(x, y) sum(x * y) / (sqrt(sum(x^2)) * sqrt(sum(y^2)))
+
+most_similar <- function(word, n = 5) {
+  vec <- embeddings[word, , drop = FALSE]
+  sims <- apply(embeddings, 1, cos_sim, y = vec)
+  sort(sims, decreasing = TRUE)[2:(n + 1)]
+}
+
+# some of top pagerank dep graph words
+query_me <- c("frame", "enclose", "fail", "couple")
+lapply(query_me, most_similar, n = 3)
+```
+
+#### Analogy
+
+Kind of expecting a lot from this much data
+
+```{r}
+analogy <- function(a, b, c, top_n = 3) {
+  cat("Analogy: '", a, "' is to '", b, "' as '", c, "' is to ?\n")
+
+  vec <- embeddings[b, ] - embeddings[a, ] + embeddings[c, ]
+  sims <- apply(embeddings, 1, cos_sim, y = vec)
+  sort(sims, decreasing = TRUE)[1:(top_n + 1)]
+}
+
+analogy("barcode", "product", "compartment")
+```
+
+## References
+
+Grover, A., & Leskovec, J. (2016, August). node2vec: Scalable feature learning for networks. In Proceedings of the 22nd ACM SIGKDD international conference on Knowledge discovery and data mining (pp. 855-864).
+
+Kipf, T. N., & Welling, M. (2016). Semi-supervised classification with graph convolutional networks. arXiv preprint arXiv:1609.02907.
+
+Levy, O., & Goldberg, Y. (2014, June). Dependency-based word embeddings. In Proceedings of the 52nd Annual Meeting of the Association for Computational Linguistics (Volume 2: Short Papers) (pp. 302-308).
+
+McInnes, L., Healy, J., & Melville, J. (2018). Umap: Uniform manifold approximation and projection for dimension reduction. arXiv preprint arXiv:1802.03426.
+
+Mihalcea, R., & Tarau, P. (2004, July). Textrank: Bringing order into text. In Proceedings of the 2004 conference on empirical methods in natural language processing (pp. 404-411).
