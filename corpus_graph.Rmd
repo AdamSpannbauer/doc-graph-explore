@@ -432,7 +432,7 @@ compare_df |>
     x = "TextRank (from co-occurrence)",
     y = "PageRank (from dependency graph)"
   ) +
-  xlim(c(0, 0.022))
+  xlim(c(0, 0.022)) +
   theme_minimal()
 ```
 
@@ -461,8 +461,8 @@ start <- Sys.time()
 
 FORCE_RETRAIN <- TRUE
 
-NUM_WALKS <- 8
-WALK_LENGTH <- 32
+NUM_WALKS <- 32
+WALK_LENGTH <- 80
 OUTPUT_DIM <- 128
 
 if (FORCE_RETRAIN | !file.exists("node2vec_embeddings.csv")) {
@@ -534,7 +534,10 @@ most_similar <- function(word, n = 5) {
 
 # some of top pagerank dep graph words
 query_me <- c("frame", "enclose", "fail", "couple")
-lapply(query_me, most_similar, n = 3)
+lapply(query_me, \(kw) {
+  print(kw)
+  most_similar(kw, n = 3)
+})
 ```
 
 #### Analogy
